@@ -12,9 +12,11 @@
  *
  * 增量策略（日常每天跑时）：
  *   - 读取仓库已有 JSON，历史月末/上年末全部保留，不做重算；
- *   - 只刷新「当日」(today = 当前日期向前回溯到最近交易日)；
- *   - 仅补齐「已有最大月末 ~ 上月末」之间缺失的月末点（通常 0~2 个，用于跨月或漏跑补偿）。
- *   因此平时每天只抓 1 个请求，极省额度、且避开中债网海外访问压力。
+ *   - 只刷新 2 个点：
+ *      ①「最新交易日」(today = 当前日期向前回溯到最近交易日)；
+ *      ②「上月末」(previous month-end = 上月最后日历日向前回溯到最近交易日，覆盖/补入该点)。
+ *   - 每次仅 2 个请求，极省额度、且避开中债网海外访问压力。
+ *   - 跨月时上月末会自动刷新（如 10 月跑会刷新 9 月末）；历史数据永不被重算。
  *   仅在「无旧数据 / 首次运行」时走全量（START_YEAR 起），保证历史完整。
  *
  * 用法（在本目录执行）：
@@ -146,34 +148,28 @@ async function pool(fns, limit) {
   const extraTasks = [];
 
   if (isIncremental) {
-    // 1) 刷新「当日」= 当前日期向前回溯到最近交易日
+    // 1) 刷新「最新交易日」(today)：当前日期向前回溯到最近交易日
     const latest = await backtrack(todayIso, 12);
     if (!latest) { console.error('未能获取最新交易日，退出'); process.exit(1); }
     newToday = { date: latest.date, kind: 'today', rates: latest.rates };
     // 移除旧的 today 点，保证全序列只有一个「当日」
     for (const [k, v] of existing) if (v.kind === 'today') existing.delete(k);
     existing.set(newToday.date, newToday);
+    console.log('→ 已更新最新交易日', newToday.date);
 
-    // 2) 仅补齐「已有最大月末 ~ 上月末」之间缺失的月末点（跨月/漏跑补偿，抓取量极小）
-    let maxME = null;
-    for (const v of existing.values()) {
-      if (v.kind === 'month' || v.kind === 'lastyear') {
-        const d = new Date(v.date + 'T00:00:00');
-        if (!maxME || d > maxME) maxME = d;
-      }
-    }
-    if (maxME) {
-      let y = maxME.getFullYear(), m = maxME.getMonth() + 1;
-      let endY = today.getFullYear(), endM = today.getMonth() - 1;
-      if (endM < 0) { endM = 11; endY--; }
-      while (y < endY || (y === endY && m <= endM)) {
-        const ld = lastCalDay(y, m);
-        if (ld <= today) {
-          const ds = iso(ld);
-          if (!existing.has(ds)) extraTasks.push({ ds, run: () => backtrack(ds, 8) });
-        }
-        m++; if (m > 11) { m = 0; y++; }
-      }
+    // 2) 刷新「上月末」(previous month-end)：重新抓取上月最后日历日对应的交易日，
+    //    覆盖/补入该点（kind 沿用既有 lastyear，否则为 month）。仅 1 个请求，跨月后确保上月末为最终值。
+    const pmY = today.getMonth() === 0 ? today.getFullYear() - 1 : today.getFullYear();
+    const pmM = today.getMonth() === 0 ? 11 : today.getMonth() - 1;
+    const prevMonthEnd = iso(lastCalDay(pmY, pmM));
+    const pm = await backtrack(prevMonthEnd, 8);
+    if (pm) {
+      const prev = existing.get(prevMonthEnd);
+      const kind = (prev && prev.kind === 'lastyear') ? 'lastyear' : 'month';
+      existing.set(prevMonthEnd, { date: prevMonthEnd, kind, rates: pm.rates });
+      console.log('→ 已更新上月末', prevMonthEnd, ' kind=' + kind);
+    } else {
+      console.log('⚠️ 上月末', prevMonthEnd, '抓取失败，保留既有值');
     }
   } else {
     // 全量（首次 / 无旧数据）：从 START_YEAR 起重算所有月末 + 最新交易日 + 上年末
