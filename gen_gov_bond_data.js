@@ -1,5 +1,5 @@
 /**
- * 政府债（地方政府债）月末收益率数据集生成器
+ * 政府债（地方政府债）月末收益率数据集生成器（增量版）
  * ------------------------------------------------------------
  * 直接抓取中国债券信息网 yield.chinabond.com.cn（qxmc=2，财政部-中国地方政府债券
  * 收益率曲线）。Node 服务端抓取无浏览器 CORS 限制，无需本地代理。
@@ -10,13 +10,19 @@
  *     "points": [ {date, kind:'month'|'lastyear'|'today', rates:{1:..,2:..,..,30:..}}, ... ]
  *   }
  *
+ * 增量策略（日常每天跑时）：
+ *   - 读取仓库已有 JSON，历史月末/上年末全部保留，不做重算；
+ *   - 只刷新「当日」(today = 当前日期向前回溯到最近交易日)；
+ *   - 仅补齐「已有最大月末 ~ 上月末」之间缺失的月末点（通常 0~2 个，用于跨月或漏跑补偿）。
+ *   因此平时每天只抓 1 个请求，极省额度、且避开中债网海外访问压力。
+ *   仅在「无旧数据 / 首次运行」时走全量（START_YEAR 起），保证历史完整。
+ *
  * 用法（在本目录执行）：
- *   node gen_gov_bond_data.js            # 生成 2020-01 ~ 至今
+ *   node gen_gov_bond_data.js            # 增量更新（已有 JSON）或全量（无 JSON）
  *   START_YEAR=2022 node gen_gov_bond_data.js
  *
  * 生成后把 gov_bond_month_end.json 推送到你的 GitHub 仓库，
  * 平台即可「联网生成」（打开即自动从 raw.githubusercontent.com 拉取，无需代理）。
- * GitHub Actions 会每月 1 号自动执行本脚本并写回仓库。
  */
 const fs = require('fs');
 const path = require('path');
@@ -118,48 +124,87 @@ async function pool(fns, limit) {
 (async () => {
   const today = new Date();
   const todayIso = iso(today);
-  console.log('=== 政府债月末数据集生成 ===');
-  console.log('起始年份:', START_YEAR, ' 当前日期:', todayIso);
+  const file = path.join(__dirname, 'gov_bond_month_end.json');
 
-  // 1) 最新交易日（今日向前回溯，最多 12 天）
-  console.log('→ 定位最新交易日 ...');
-  const latest = await backtrack(todayIso, 12);
-  if (!latest) { console.error('未能获取最新交易日，退出'); process.exit(1); }
-  console.log('  最新交易日 =', latest.date);
+  // 读取已有数据（增量基础）
+  let oldPoints = [];
+  let oldMeta = null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (Array.isArray(raw.points)) oldPoints = raw.points;
+    oldMeta = raw.meta || null;
+  } catch (e) { /* 首次运行无文件 */ }
 
-  // 2) 各月末（含上年末）
-  const tasks = [];
-  for (let y = START_YEAR; y <= today.getFullYear(); y++) {
-    const months = (y === today.getFullYear()) ? today.getMonth() : 12; // 当年只到当前月
-    for (let m = 0; m < months; m++) {
-      const ld = lastCalDay(y, m);
-      if (ld > today) continue;
-      tasks.push({ key: iso(ld), run: () => backtrack(iso(ld), 8) });
+  const existing = new Map();
+  oldPoints.forEach(p => { if (p && p.date) existing.set(p.date, p); });
+
+  const isIncremental = existing.size > 0;
+  console.log('=== 政府债数据集生成（' + (isIncremental ? '增量' : '全量') + '）===');
+  console.log('当前日期:', todayIso, ' 已有时点:', existing.size);
+
+  let newToday = null;
+  const extraTasks = [];
+
+  if (isIncremental) {
+    // 1) 刷新「当日」= 当前日期向前回溯到最近交易日
+    const latest = await backtrack(todayIso, 12);
+    if (!latest) { console.error('未能获取最新交易日，退出'); process.exit(1); }
+    newToday = { date: latest.date, kind: 'today', rates: latest.rates };
+    // 移除旧的 today 点，保证全序列只有一个「当日」
+    for (const [k, v] of existing) if (v.kind === 'today') existing.delete(k);
+    existing.set(newToday.date, newToday);
+
+    // 2) 仅补齐「已有最大月末 ~ 上月末」之间缺失的月末点（跨月/漏跑补偿，抓取量极小）
+    let maxME = null;
+    for (const v of existing.values()) {
+      if (v.kind === 'month' || v.kind === 'lastyear') {
+        const d = new Date(v.date + 'T00:00:00');
+        if (!maxME || d > maxME) maxME = d;
+      }
     }
+    if (maxME) {
+      let y = maxME.getFullYear(), m = maxME.getMonth() + 1;
+      let endY = today.getFullYear(), endM = today.getMonth() - 1;
+      if (endM < 0) { endM = 11; endY--; }
+      while (y < endY || (y === endY && m <= endM)) {
+        const ld = lastCalDay(y, m);
+        if (ld <= today) {
+          const ds = iso(ld);
+          if (!existing.has(ds)) extraTasks.push({ ds, run: () => backtrack(ds, 8) });
+        }
+        m++; if (m > 11) { m = 0; y++; }
+      }
+    }
+  } else {
+    // 全量（首次 / 无旧数据）：从 START_YEAR 起重算所有月末 + 最新交易日 + 上年末
+    const latest = await backtrack(todayIso, 12);
+    if (!latest) { console.error('未能获取最新交易日，退出'); process.exit(1); }
+    newToday = { date: latest.date, kind: 'today', rates: latest.rates };
+
+    for (let y = START_YEAR; y <= today.getFullYear(); y++) {
+      const months = (y === today.getFullYear()) ? today.getMonth() : 12;
+      for (let m = 0; m < months; m++) {
+        const ld = lastCalDay(y, m);
+        if (ld > today) continue;
+        extraTasks.push({ ds: iso(ld), run: () => backtrack(iso(ld), 8) });
+      }
+    }
+    const ly = await backtrack(iso(lastCalDay(START_YEAR - 1, 11)), 8);
+    if (ly) existing.set(ly.date, { date: ly.date, kind: 'lastyear', rates: ly.rates });
   }
-  console.log('→ 抓取 ' + tasks.length + ' 个潜在月末（并发 5）...');
-  const results = await pool(tasks.map(t => t.run), 5);
 
-  const points = [];
-  // 上年末
-  const lastYearDec = backtrack(iso(lastCalDay(START_YEAR - 1, 11)), 8);
-  const ly = await lastYearDec;
-  if (ly) points.push({ date: ly.date, kind: 'lastyear', rates: ly.rates });
+  if (extraTasks.length) {
+    console.log('→ 补抓 ' + extraTasks.length + ' 个缺失/最新月末（并发 5）...');
+    const res = await pool(extraTasks.map(t => t.run), 5);
+    extraTasks.forEach((t, i) => { if (res[i]) existing.set(t.ds, { date: t.ds, kind: 'month', rates: res[i].rates }); });
+  } else {
+    console.log('→ 无需补抓历史月末，仅更新「当日」');
+  }
 
-  tasks.forEach((t, i) => {
-    const r = results[i];
-    if (r) points.push({ date: r.date, kind: 'month', rates: r.rates });
-  });
-  // 最新交易日作为 today
-  points.push({ date: latest.date, kind: 'today', rates: latest.rates });
-
-  // 去重（按 date），today 优先
-  const byDate = new Map();
-  points.forEach(p => { byDate.set(p.date, p); });
-  const dedup = [...byDate.values()].sort((a, b) => a.date < b.date ? -1 : 1);
+  const dedup = [...existing.values()].sort((a, b) => a.date < b.date ? -1 : 1);
 
   const out = {
-    meta: {
+    meta: oldMeta || {
       generatedAt: todayIso,
       curveName: '财政部-中国地方政府债券收益率曲线',
       terms: TARGET_TERMS,
@@ -168,11 +213,11 @@ async function pool(fns, limit) {
     },
     points: dedup,
   };
+  out.meta.generatedAt = todayIso;
 
-  const file = path.join(__dirname, 'gov_bond_month_end.json');
   fs.writeFileSync(file, JSON.stringify(out, null, 2), 'utf8');
   const months = dedup.filter(p => p.kind === 'month').length;
   console.log('✅ 写入', file);
-  console.log('   时点总数:', dedup.length, ' 月末:', months, ' 上年末:', dedup.filter(p => p.kind === 'lastyear').length, ' 当日:', latest.date);
+  console.log('   时点总数:', dedup.length, ' 月末:', months, ' 上年末:', dedup.filter(p => p.kind === 'lastyear').length, ' 当日:', newToday.date);
   console.log('   覆盖:', dedup[0].date, '~', dedup[dedup.length - 1].date);
 })().catch(e => { console.error('生成失败:', e); process.exit(1); });
