@@ -1,0 +1,12 @@
+{
+  "name": "gov-bond-month-end",
+  "version": "1.0.0",
+  "private": true,
+  "description": "中国地方政府债券收益率曲线月末数据集自动生成（GitHub Actions 每月 1 号定时刷新）",
+  "scripts": {
+    "generate": "node gen_gov_bond_data.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
